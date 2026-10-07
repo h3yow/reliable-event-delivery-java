@@ -58,6 +58,19 @@ public class EventController {
         return service.replay(id);
     }
 
+    /** Operations summary: per-status counts, backlog age, retry spread. */
+    @GetMapping("/stats")
+    public com.github.h3yow.reliableeventdeliveryjava.event.EventStatsView stats() {
+        return service.stats();
+    }
+
+    @ExceptionHandler(com.github.h3yow.reliableeventdeliveryjava.event.EventCapacityException.class)
+    public ResponseEntity<ErrorResponse> capacity(
+            com.github.h3yow.reliableeventdeliveryjava.event.EventCapacityException e) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .body(new ErrorResponse("CAPACITY_EXCEEDED", e.getMessage()));
+    }
+
     @ExceptionHandler(EventConflictException.class)
     public ResponseEntity<ErrorResponse> conflict(EventConflictException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT)

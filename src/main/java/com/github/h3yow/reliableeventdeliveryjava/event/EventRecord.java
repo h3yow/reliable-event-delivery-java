@@ -18,10 +18,12 @@ public final class EventRecord {
     private final long version;
     private final Instant createdAt;
     private final Instant updatedAt;
+    /** Earliest time the next delivery attempt may start; null = due now. */
+    private final Instant nextAttemptAt;
 
     public EventRecord(String id, String idempotencyKey, String payload, EventStatus status,
                        int attempts, int maxAttempts, DeadReason deadReason, String lastError,
-                       long version, Instant createdAt, Instant updatedAt) {
+                       long version, Instant createdAt, Instant updatedAt, Instant nextAttemptAt) {
         this.id = id;
         this.idempotencyKey = idempotencyKey;
         this.payload = payload;
@@ -33,6 +35,7 @@ public final class EventRecord {
         this.version = version;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
+        this.nextAttemptAt = nextAttemptAt;
     }
 
     public String getId() { return id; }
@@ -46,4 +49,5 @@ public final class EventRecord {
     public long getVersion() { return version; }
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
+    public Instant getNextAttemptAt() { return nextAttemptAt; }
 }

@@ -1,5 +1,6 @@
 package com.github.h3yow.reliableeventdeliveryjava.event;
 
+import java.time.Instant;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -8,8 +9,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * Delivers events to a handler with bounded retries and exactly-once side
- * effect semantics under concurrent / duplicate consumption.
+ * Delivers events to a handler with bounded, delayed retries and
+ * exactly-once side effect semantics under concurrent / duplicate
+ * consumption.
  *
  * <p>Two guards cooperate:
  * <ul>
@@ -18,9 +20,14 @@ import org.springframework.stereotype.Component;
  *   <li>a local applied-set records event ids whose side effect already ran,
  *       so a duplicate delivery of an already-succeeded event is a no-op.</li>
  * </ul>
- * If the JVM is interrupted mid-attempt the event stays IN_PROGRESS in the
- * store; calling {@link #process} again (or {@code markFailed}) recovers it
- * without losing the record.
+ * A retryable failure schedules the next attempt via
+ * {@code nextAttemptAt} (exponential backoff, bounded, configurable); while
+ * waiting, the event is PENDING but not due, so it never blocks other events.
+ *
+ * <p>If the JVM is interrupted mid-attempt the event stays IN_PROGRESS in the
+ * store until the recovery sweep ({@link EventStore#recoverStuck}) returns it
+ * to PENDING; the applied-set then still suppresses any side effect that had
+ * already run, so recovery never duplicates effects within the process.
  */
 @Component
 public class EventProcessor {
@@ -28,10 +35,18 @@ public class EventProcessor {
     private static final Logger log = LoggerFactory.getLogger(EventProcessor.class);
 
     private final EventStore store;
+    private final EventDeliveryProperties properties;
     private final Set<String> applied = ConcurrentHashMap.newKeySet();
 
-    public EventProcessor(EventStore store) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public EventProcessor(EventStore store, EventDeliveryProperties properties) {
         this.store = store;
+        this.properties = properties;
+    }
+
+    /** Convenience for tests: default retry tuning. */
+    public EventProcessor(EventStore store) {
+        this(store, new EventDeliveryProperties());
     }
 
     /**
@@ -68,9 +83,18 @@ public class EventProcessor {
         } catch (NonRetryableException e) {
             log.warn("event={} non-retryable failure: {}", eventId, e.getMessage());
             return store.markFailed(eventId, false, e.getMessage());
+        } catch (IllegalStateException e) {
+            // Recovery reclaimed the event while the handler was running; the
+            // record is intact and the applied-set guards the side effect.
+            log.info("event={} completion lost the race with recovery: {}", eventId, e.getMessage());
+            return store.find(eventId).orElseThrow();
         } catch (Exception e) {
-            log.warn("event={} retryable failure: {}", eventId, e.getMessage());
-            return store.markFailed(eventId, true, e.getMessage());
+            int nextAttempt = claimed.get().getAttempts() + 1;
+            Instant nextAttemptAt = Instant.now()
+                    .plusMillis(properties.getRetry().backoffForAttempt(nextAttempt));
+            log.warn("event={} retryable failure: {} (next attempt at {})",
+                    eventId, e.getMessage(), nextAttemptAt);
+            return store.markFailed(eventId, true, e.getMessage(), nextAttemptAt);
         }
     }
 }

@@ -50,7 +50,7 @@ public class EventStore {
         String id = UUID.randomUUID().toString();
         Instant now = Instant.now();
         EventRecord created = new EventRecord(id, idempotencyKey, payload, EventStatus.PENDING,
-                0, maxAttempts, null, null, versions.incrementAndGet(), now, now);
+                0, maxAttempts, null, null, versions.incrementAndGet(), now, now, null);
         // Atomic: only the first writer of this key wins; losers re-check conflict.
         String winner = idByKey.putIfAbsent(idempotencyKey, id);
         if (winner != null) {
@@ -63,28 +63,39 @@ public class EventStore {
 
     /** Atomically move PENDING -> IN_PROGRESS; empty if already claimed/terminal. */
     public Optional<EventRecord> claim(String eventId) {
-        return transition(eventId, EventStatus.PENDING, EventStatus.IN_PROGRESS, null, null, false);
+        return transition(eventId, EventStatus.PENDING, EventStatus.IN_PROGRESS, null, null, false, null);
     }
 
     /** IN_PROGRESS -> SUCCEEDED. */
     public EventRecord markSucceeded(String eventId) {
-        return transition(eventId, EventStatus.IN_PROGRESS, EventStatus.SUCCEEDED, null, null, false)
+        return transition(eventId, EventStatus.IN_PROGRESS, EventStatus.SUCCEEDED, null, null, false, null)
                 .orElseThrow(() -> new IllegalStateException("event " + eventId + " not IN_PROGRESS"));
     }
 
     /**
      * IN_PROGRESS -> PENDING (retryable, attempts left) or
      * IN_PROGRESS -> DEAD (retry exhausted / non-retryable), with a
-     * distinguishable {@link DeadReason}.
+     * distinguishable {@link DeadReason}. The event is due again immediately.
      */
     public EventRecord markFailed(String eventId, boolean retryable, String error) {
+        return markFailed(eventId, retryable, error, null);
+    }
+
+    /**
+     * As {@link #markFailed(String, boolean, String)} but schedules the next
+     * attempt no earlier than {@code nextAttemptAt} (ignored when the event
+     * goes DEAD). While waiting, the event stays PENDING but is not eligible
+     * for delivery, so it never blocks other events.
+     */
+    public EventRecord markFailed(String eventId, boolean retryable, String error, Instant nextAttemptAt) {
         EventRecord current = require(eventId);
         boolean exhausted = current.getAttempts() + 1 >= current.getMaxAttempts();
         EventStatus target = (retryable && !exhausted) ? EventStatus.PENDING : EventStatus.DEAD;
         DeadReason reason = target == EventStatus.DEAD
                 ? (retryable ? DeadReason.RETRY_EXHAUSTED : DeadReason.NON_RETRYABLE)
                 : null;
-        return transition(eventId, EventStatus.IN_PROGRESS, target, reason, error, true)
+        Instant scheduled = target == EventStatus.PENDING ? nextAttemptAt : null;
+        return transition(eventId, EventStatus.IN_PROGRESS, target, reason, error, true, scheduled)
                 .orElseThrow(() -> new IllegalStateException("event " + eventId + " not IN_PROGRESS"));
     }
 
@@ -93,7 +104,7 @@ public class EventStore {
         EventRecord current = require(eventId);
         EventRecord reset = new EventRecord(current.getId(), current.getIdempotencyKey(),
                 current.getPayload(), EventStatus.PENDING, 0, current.getMaxAttempts(),
-                null, null, versions.incrementAndGet(), current.getCreatedAt(), Instant.now());
+                null, null, versions.incrementAndGet(), current.getCreatedAt(), Instant.now(), null);
         synchronized (current.getId().intern()) {
             EventRecord latest = require(eventId);
             if (latest.getStatus() != EventStatus.DEAD) {
@@ -105,6 +116,54 @@ public class EventStore {
         log.info("event={} transition DEAD->PENDING replay attempts=0/{}",
                 eventId, reset.getMaxAttempts());
         return reset;
+    }
+
+    /**
+     * Recover events stuck IN_PROGRESS since before {@code cutoff} (consumer
+     * crashed or never finished) back to PENDING, due immediately. Attempts
+     * are preserved so progress is not lost; the applied-set in the processor
+     * still suppresses any side effect that had already run.
+     *
+     * @return the recovered records, in recovery order
+     */
+    public List<EventRecord> recoverStuck(Instant cutoff) {
+        List<EventRecord> recovered = new java.util.ArrayList<>();
+        for (EventRecord record : findAll()) {
+            if (record.getStatus() == EventStatus.IN_PROGRESS
+                    && !record.getUpdatedAt().isAfter(cutoff)) {
+                transition(record.getId(), EventStatus.IN_PROGRESS, EventStatus.PENDING,
+                        null, "recovered from interrupted consumer", false, null)
+                        .ifPresent(r -> {
+                            log.warn("event={} recovered IN_PROGRESS->PENDING after being stuck since {}",
+                                    r.getId(), record.getUpdatedAt());
+                            recovered.add(r);
+                        });
+            }
+        }
+        return recovered;
+    }
+
+    /** PENDING events due for delivery at {@code now}, oldest first, capped. */
+    public List<EventRecord> findDuePending(Instant now, int limit) {
+        return byId.values().stream()
+                .filter(r -> r.getStatus() == EventStatus.PENDING)
+                .filter(r -> r.getNextAttemptAt() == null || !r.getNextAttemptAt().isAfter(now))
+                .sorted(java.util.Comparator.comparing(EventRecord::getCreatedAt))
+                .limit(limit)
+                .toList();
+    }
+
+    /** Number of events still occupying delivery capacity (PENDING + IN_PROGRESS). */
+    public long countActive() {
+        return byId.values().stream()
+                .filter(r -> r.getStatus() == EventStatus.PENDING
+                        || r.getStatus() == EventStatus.IN_PROGRESS)
+                .count();
+    }
+
+    public Optional<EventRecord> findByKey(String idempotencyKey) {
+        String id = idByKey.get(idempotencyKey);
+        return id == null ? Optional.empty() : Optional.ofNullable(byId.get(id));
     }
 
     public Optional<EventRecord> find(String eventId) {
@@ -125,7 +184,7 @@ public class EventStore {
 
     private Optional<EventRecord> transition(String eventId, EventStatus from, EventStatus to,
                                              DeadReason deadReason, String error,
-                                             boolean incrementAttempts) {
+                                             boolean incrementAttempts, Instant nextAttemptAt) {
         synchronized (eventId.intern()) {
             EventRecord current = byId.get(eventId);
             if (current == null || current.getStatus() != from) {
@@ -135,12 +194,13 @@ public class EventStore {
                     current.getPayload(), to,
                     incrementAttempts ? current.getAttempts() + 1 : current.getAttempts(),
                     current.getMaxAttempts(), deadReason, error,
-                    versions.incrementAndGet(), current.getCreatedAt(), Instant.now());
+                    versions.incrementAndGet(), current.getCreatedAt(), Instant.now(), nextAttemptAt);
             byId.put(eventId, next);
-            log.info("event={} transition {}->{} attempts={}/{}{}{}",
+            log.info("event={} transition {}->{} attempts={}/{}{}{}{}",
                     eventId, from, to, next.getAttempts(), next.getMaxAttempts(),
                     deadReason != null ? " deadReason=" + deadReason : "",
-                    error != null ? " error=" + error : "");
+                    error != null ? " error=" + error : "",
+                    nextAttemptAt != null ? " nextAttemptAt=" + nextAttemptAt : "");
             return Optional.of(next);
         }
     }
