@@ -4,7 +4,9 @@ import java.util.List;
 import java.util.Map;
 
 import com.github.h3yow.reliableeventdeliveryjava.event.EventConflictException;
+import com.github.h3yow.reliableeventdeliveryjava.event.EventOverloadException;
 import com.github.h3yow.reliableeventdeliveryjava.event.EventRecord;
+import com.github.h3yow.reliableeventdeliveryjava.event.EventStats;
 import com.github.h3yow.reliableeventdeliveryjava.event.EventService;
 import com.github.h3yow.reliableeventdeliveryjava.event.EventStore;
 import org.springframework.http.HttpStatus;
@@ -56,6 +58,18 @@ public class EventController {
     @PostMapping("/{id}/replay")
     public EventRecord replay(@PathVariable String id) {
         return service.replay(id);
+    }
+
+    /** Operational summary: per-status counts, backlog, oldest wait, retry spread. */
+    @GetMapping("/stats")
+    public EventStats stats() {
+        return service.stats();
+    }
+
+    @ExceptionHandler(EventOverloadException.class)
+    public ResponseEntity<ErrorResponse> overloaded(EventOverloadException e) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .body(new ErrorResponse("OVERLOADED", e.getMessage()));
     }
 
     @ExceptionHandler(EventConflictException.class)

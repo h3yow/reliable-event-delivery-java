@@ -5,6 +5,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
@@ -18,9 +20,11 @@ import org.springframework.stereotype.Component;
  *   <li>a local applied-set records event ids whose side effect already ran,
  *       so a duplicate delivery of an already-succeeded event is a no-op.</li>
  * </ul>
- * If the JVM is interrupted mid-attempt the event stays IN_PROGRESS in the
- * store; calling {@link #process} again (or {@code markFailed}) recovers it
- * without losing the record.
+ * Retryable failures return the event to PENDING with a per-event
+ * {@code nextAttemptAt} backoff, so one event waiting to retry never blocks
+ * the delivery of other events. If the JVM is interrupted mid-attempt the
+ * event stays IN_PROGRESS in the store until {@link EventStore#reclaimStale}
+ * returns it to PENDING without losing the record.
  */
 @Component
 public class EventProcessor {
@@ -28,10 +32,19 @@ public class EventProcessor {
     private static final Logger log = LoggerFactory.getLogger(EventProcessor.class);
 
     private final EventStore store;
+    private final long retryDelayMs;
     private final Set<String> applied = ConcurrentHashMap.newKeySet();
 
+    /** Convenience constructor: failures are due again immediately. */
     public EventProcessor(EventStore store) {
+        this(store, 0);
+    }
+
+    @Autowired
+    public EventProcessor(EventStore store,
+                          @Value("${events.retry-delay-ms:2000}") long retryDelayMs) {
         this.store = store;
+        this.retryDelayMs = retryDelayMs;
     }
 
     /**
@@ -69,8 +82,9 @@ public class EventProcessor {
             log.warn("event={} non-retryable failure: {}", eventId, e.getMessage());
             return store.markFailed(eventId, false, e.getMessage());
         } catch (Exception e) {
-            log.warn("event={} retryable failure: {}", eventId, e.getMessage());
-            return store.markFailed(eventId, true, e.getMessage());
+            log.warn("event={} retryable failure, next attempt in {}ms: {}",
+                    eventId, retryDelayMs, e.getMessage());
+            return store.markFailed(eventId, true, e.getMessage(), retryDelayMs);
         }
     }
 }

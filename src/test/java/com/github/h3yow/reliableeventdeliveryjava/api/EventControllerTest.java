@@ -18,7 +18,7 @@ import org.springframework.test.web.servlet.MvcResult;
  * HTTP-level checks: duplicate submits are idempotent, conflicts are
  * rejected with a distinguishable reason, and replay is controlled.
  */
-@SpringBootTest(classes = Application.class)
+@SpringBootTest(classes = Application.class, properties = "events.dispatcher.enabled=false")
 @AutoConfigureMockMvc
 class EventControllerTest {
 
